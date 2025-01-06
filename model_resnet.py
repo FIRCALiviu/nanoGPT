@@ -70,8 +70,10 @@ class Resnetmini(nn.Module):
         self.block2 = nn.Sequential(ResidualBlock(128,128),ResidualBlock(128,128),ResidualBlock(128,512))
         self.block3 = nn.Sequential(ResidualBlock(512,512),ResidualBlock(512,512),ResidualBlock(512,2**10))
         self.pool  = nn.AdaptiveAvgPool2d((1,1))
-        self.fc = nn.Linear(1024,vec_len)
-    
+        self.fc1 = nn.Linear(1024,1024)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(1024,vec_len)
+        
     
     def forward(self,x):
         x = self.conv1(x)
@@ -80,9 +82,11 @@ class Resnetmini(nn.Module):
         x = self.block3(x)
         vec = self.pool(x)
         vec = torch.flatten(vec,1)
-        vec = self.fc(vec)
-        return vec
+        vec = self.fc1(vec)
+        vec = self.relu(vec)
 
+        vec = self.fc2(vec)
+        return vec
 # test if this crap works
 
 

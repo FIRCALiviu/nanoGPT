@@ -4,6 +4,18 @@ from model_resnet import Resnetmini
 from torch.nn import functional as F
 import math
 
+from dataclasses import dataclass
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -64,6 +76,61 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+
+
+class CausalReflection(nn.Module):
+
+    def __init__(self, config: GPTConfig,image_width):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query
+        self.c_attn = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
+        # images reflection
+        self.v_proj = nn.Linear(config.n_embd,config.n_head*image_width*image_width)
+
+        
+        # regularization
+        self.width = image_width
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k = self.c_attn(x).split(self.n_embd, dim=2)
+        v = self.v_proj(x)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, self.width*self.width).transpose(1, 2) # (B, nh, T, w*w)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, self.n_head,self.width*self.width) # re-assemble all head outputs side by side
+
+
+        return y
+
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -96,39 +163,10 @@ class Block(nn.Module):
 
 from dataclasses import dataclass
 
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
-
-class Shot(nn.Module):
-    def __init__(self,chan_word,width=16,pictures=16,n_embd=128):
+class MirrorNet(nn.Module):
+    def __init__(self,n_emb:int =12*64,vocab_size: int = 50304 ,block_size: int = 1024):
         super().__init__()
-        self.chan_word = chan_word
-        self.width = width
-        self.pictures = pictures
-        self.n_embd = n_embd
-        # define mapping on the image according to content
-        self.keys = nn.Parameter(nn.Linear(width*width*pictures,n_embd,bias=False).weight.reshape(pictures,width*width,n_embd))
-        self.query = nn.Linear(chan_word,pictures*n_embd)
-    def forward(self,x):
-        B,T,C = x.shape
-        queries = self.query(x).view(B,T,self.pictures,self.n_embd,1)
-        
-        prod = self.keys@queries / math.sqrt(self.n_embd)
-        attention = F.softmax(prod.reshape(B,T,self.pictures,self.width*self.width),dim=-1)
-        return attention
-
-class ShotNet_Chained(nn.Module):
-    def __init__(self,n_emb:int =768,vocab_size: int = 50304 ,block_size: int = 1024):
-        super().__init__()
-        self.n_emb = n_emb
         self.wpe = nn.Embedding(vocab_size,n_emb)
         self.wte = nn.Embedding(vocab_size,n_emb)
         
@@ -139,29 +177,26 @@ class ShotNet_Chained(nn.Module):
         self.block2 = self._make_gpt_layer(n_emb,vocab_size,block_size)
         
         self.block3 = self._make_gpt_layer(n_emb,vocab_size,block_size)
-        
-        
+        self.n_emb = n_emb
         self.n_pictures = 12
         self.pic_width = 32
-        self.image_mapping1 = Shot(n_emb,self.pic_width,self.n_pictures) ## chan_word = n_embd intrun transformer, foarte confuzing
+        # who tf decided on this garbage class
+        self.image_mapping1 = CausalReflection(GPTConfig(block_size=block_size,vocab_size=vocab_size,n_layer=None,n_head=self.n_pictures,n_embd=n_emb,dropout=0,bias=False),image_width=self.pic_width)
         self.vocab_size= vocab_size
         
 
-        self.resnet1 = Resnetmini(self.n_pictures,n_emb) ## resnet mini , only 75% faster than big one
+        self.resnet1 = Resnetmini(self.n_pictures,n_emb) ## 75% reduction in compute compared to resnet3
 
         self.block4 = self._make_gpt_layer(n_emb,vocab_size,block_size)
         self.block5 = self._make_gpt_layer(n_emb,vocab_size,block_size)
-        self.block6 = self._make_gpt_layer(n_emb,vocab_size,block_size)
-        self.block7 = self._make_gpt_layer(n_emb,vocab_size,block_size)
-
-        self.image_mapping2 = Shot(n_emb,self.pic_width,self.n_pictures) 
-
-
+        self.image_mapping2 = CausalReflection(GPTConfig(block_size=block_size,vocab_size=vocab_size,n_layer=None,n_head=self.n_pictures,n_embd=n_emb,dropout=0,bias=False),image_width=self.pic_width)
         self.resnet2 = Resnetmini(self.n_pictures,n_emb)
 
+        self.block6 = self._make_gpt_layer(n_emb,vocab_size,block_size)
+        self.block7 = self._make_gpt_layer(n_emb,vocab_size,block_size)
+        self.image_mapping3 = CausalReflection(GPTConfig(block_size=block_size,vocab_size=vocab_size,n_layer=None,n_head=self.n_pictures,n_embd=n_emb,dropout=0,bias=False),image_width=self.pic_width)
+        self.resnet3 = Resnetmini(self.n_pictures,vocab_size)
 
-        self.image_mapping3 = Shot(n_emb,self.pic_width,self.n_pictures)
-        self.resnet3 = Resnetmini(self.n_pictures,vocab_size) 
     def _make_gpt_layer(self,n_emb,vocab_size,block_size):
         config = GPTConfig(block_size,vocab_size,None,8,n_emb,0,False)
         return Block(config)
@@ -176,26 +211,20 @@ class ShotNet_Chained(nn.Module):
         x = self.block2(x)
         x = self.block3(x)
         images = self.image_mapping1(x)
-        ## now we simply add image[i] and image[i+1] to image[i+1] to ensure connectivity btwn tokens
-        for i in range(1,t):
-            images[:,i,:,:]+=images[:,i-1,:,:]
         
         x = self.resnet1(images.reshape(b*t,self.n_pictures,self.pic_width,self.pic_width)).reshape(b,t,self.n_emb)
         
         x = self.block4(x)
         x = self.block5(x)
-        images = self.image_mapping2(x)  
-        for i in range(1,t):
-            images[:,i,:,:]+=images[:,i-1,:,:]
+
+        images = self.image_mapping2(x)
         x = self.resnet2(images.reshape(b*t,self.n_pictures,self.pic_width,self.pic_width)).reshape(b,t,self.n_emb)
 
         x = self.block6(x)
         x = self.block7(x)
-        images = self.image_mapping3(x)
-        for i in range(1,t):
-            images[:,i,:,:]+=images[:,i-1,:,:]
-        x = self.resnet3(images.reshape(b*t,self.n_pictures,self.pic_width,self.pic_width)).reshape(b,t,self.vocab_size)
-        return x
+        images  =self.image_mapping2(x)
+        x = self.resnet3(images.reshape(b*t,self.n_pictures,self.pic_width,self.pic_width))
+        return x.reshape(b,t,self.vocab_size)
     
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
@@ -223,8 +252,9 @@ class ShotNet_Chained(nn.Module):
 
         return optimizer
 if __name__=="__main__":
-    model = ShotNet_Chained()
+    model = MirrorNet()
+
     words = torch.randint(0,900,(10,100))
-    
-    imag = model(words)
-    print(imag.shape)
+    with torch.no_grad():
+        imag = model(words)
+        print(imag.shape)
