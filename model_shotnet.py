@@ -3,7 +3,7 @@ import torch
 from model_resnet import Resnet3
 from torch.nn import functional as F
 import math
-
+import inspect
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -122,13 +122,14 @@ class Shot(nn.Module):
         queries = self.query(x).view(B,T,self.pictures,self.n_embd,1)
         
         prod = self.keys@queries / math.sqrt(self.n_embd)
-        attention = F.softmax(prod.reshape(B,T,self.pictures,self.width*self.width),dim=-1)
+        attention = F.softmax(prod.reshape(B,T,self.pictures,self.width*self.width),dim=-1)*self.width
         return attention
 
 class ShotNet(nn.Module):
     def __init__(self,n_emb:int =512,vocab_size: int = 50304 ,block_size: int = 1024):
         super().__init__()
-        self.wpe = nn.Embedding(vocab_size,n_emb)
+        self.block_size = 1024
+        self.wpe = nn.Embedding(self.block_size,n_emb)
         self.wte = nn.Embedding(vocab_size,n_emb)
         
         # 3 traditional GPT layers to fine tune tokens
@@ -139,9 +140,10 @@ class ShotNet(nn.Module):
         
         self.block3 = self._make_gpt_layer(n_emb,vocab_size,block_size)
         self.n_pictures = 8
-        self.pic_width = 16
-        self.image_mapping = Shot(n_emb,self.pic_width,self.n_pictures) ## chan_word = n_embd intrun transformer, foarte confuzing
+        self.pic_width = 20
         self.vocab_size= vocab_size
+        self.image_mapping = Shot(n_emb,self.pic_width,self.n_pictures) ## chan_word = n_embd intrun transformer, foarte confuzing
+        
         
 
         self.resnet = Resnet3(self.n_pictures,vocab_size)
@@ -150,7 +152,7 @@ class ShotNet(nn.Module):
         config = GPTConfig(block_size,vocab_size,None,8,n_emb,0,False)
         return Block(config)
 
-    def forward(self,x):
+    def forward(self,x,targets=None):
         device = x.device
         b,t = x.shape
         pos = torch.arange(0, t, dtype=torch.long, device=device) 
@@ -161,12 +163,19 @@ class ShotNet(nn.Module):
         x = self.block3(x)
         images = self.image_mapping(x)
         ## now we simply add image[i] and image[i+1] to image[i+1] to ensure connectivity btwn tokens
+        images_clone = torch.empty_like(images)
         for i in range(1,t):
-            images[:,i,:,:]+=images[:,i-1,:,:]
-        
-        logits = self.resnet(images.reshape(b*t,self.n_pictures,self.pic_width,self.pic_width))
-        return logits.reshape(b,t,self.vocab_size)
-    
+            images_clone[:,i,:,:]  = images[:,i,:,:] + images[:,i-1,:,:]
+
+
+        logits = self.resnet(images_clone.reshape(b*t,self.n_pictures,self.pic_width,self.pic_width))
+        logits = logits.reshape(b,t,self.vocab_size)
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            loss = None
+        return logits,loss
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -193,8 +202,14 @@ class ShotNet(nn.Module):
 
         return optimizer
 if __name__=="__main__":
+    torch.autograd.set_detect_anomaly(True)
     model = ShotNet()
+    copy = model.wpe.weight.clone().detach()
     words = torch.randint(0,900,(10,100))
-    with torch.no_grad():
-        imag = model(words)
-        print(imag.shape)
+    targets = torch.randint(0,900,(10,100))
+    optimizer  = torch.optim.AdamW(model.parameters())
+
+    _,loss= model(words,targets)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
