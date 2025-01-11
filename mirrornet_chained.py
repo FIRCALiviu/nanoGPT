@@ -3,7 +3,7 @@ import torch
 from model_resnet import Resnetmini
 from torch.nn import functional as F
 import math
-
+import inspect
 from dataclasses import dataclass
 @dataclass
 class GPTConfig:
@@ -167,9 +167,12 @@ from dataclasses import dataclass
 class MirrorNet(nn.Module):
     def __init__(self,n_emb:int =12*64,vocab_size: int = 50304 ,block_size: int = 1024):
         super().__init__()
-        self.wpe = nn.Embedding(vocab_size,n_emb)
+        self.block_size = 1024
+        self.wpe = nn.Embedding(self.block_size,n_emb)
         self.wte = nn.Embedding(vocab_size,n_emb)
         
+        self.bn1 = nn.BatchNorm1d(n_emb)
+        self.bn2 = nn.BatchNorm1d(n_emb)
         # 3 traditional GPT layers to fine tune tokens
 
         self.block1 = self._make_gpt_layer(n_emb,vocab_size,block_size)
@@ -201,7 +204,7 @@ class MirrorNet(nn.Module):
         config = GPTConfig(block_size,vocab_size,None,8,n_emb,0,False)
         return Block(config)
 
-    def forward(self,x):
+    def forward(self,x,targets = None):
         device = x.device
         b,t = x.shape
         pos = torch.arange(0, t, dtype=torch.long, device=device) 
@@ -213,19 +216,24 @@ class MirrorNet(nn.Module):
         images = self.image_mapping1(x)
         
         x = self.resnet1(images.reshape(b*t,self.n_pictures,self.pic_width,self.pic_width)).reshape(b,t,self.n_emb)
-        
+        x = self.bn1(x)
         x = self.block4(x)
         x = self.block5(x)
 
         images = self.image_mapping2(x)
         x = self.resnet2(images.reshape(b*t,self.n_pictures,self.pic_width,self.pic_width)).reshape(b,t,self.n_emb)
-
+        x = self.bn2(x)
         x = self.block6(x)
         x = self.block7(x)
         images  =self.image_mapping2(x)
         x = self.resnet3(images.reshape(b*t,self.n_pictures,self.pic_width,self.pic_width))
-        return x.reshape(b,t,self.vocab_size)
-    
+        logits = x.reshape(b,t,self.vocab_size)
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            loss = None
+        return logits,loss
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -255,6 +263,7 @@ if __name__=="__main__":
     model = MirrorNet()
 
     words = torch.randint(0,900,(10,100))
+    targets = torch.randint(0,900,(10,100))
     with torch.no_grad():
-        imag = model(words)
-        print(imag.shape)
+        logits,loss = model(words,targets)
+        print(logits.shape,loss.item())

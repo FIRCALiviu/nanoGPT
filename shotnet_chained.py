@@ -3,7 +3,7 @@ import torch
 from model_resnet import Resnetmini
 from torch.nn import functional as F
 import math
-
+import inspect
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -38,7 +38,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x,targets=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -129,7 +129,8 @@ class ShotNet_Chained(nn.Module):
     def __init__(self,n_emb:int =768,vocab_size: int = 50304 ,block_size: int = 1024):
         super().__init__()
         self.n_emb = n_emb
-        self.wpe = nn.Embedding(vocab_size,n_emb)
+        self.block_size = 1024
+        self.wpe = nn.Embedding(self.block_size,n_emb)
         self.wte = nn.Embedding(vocab_size,n_emb)
         
         # 3 traditional GPT layers to fine tune tokens
@@ -142,7 +143,7 @@ class ShotNet_Chained(nn.Module):
         
         
         self.n_pictures = 12
-        self.pic_width = 32
+        self.pic_width = 16 
         self.image_mapping1 = Shot(n_emb,self.pic_width,self.n_pictures) ## chan_word = n_embd intrun transformer, foarte confuzing
         self.vocab_size= vocab_size
         
@@ -166,7 +167,7 @@ class ShotNet_Chained(nn.Module):
         config = GPTConfig(block_size,vocab_size,None,8,n_emb,0,False)
         return Block(config)
 
-    def forward(self,x):
+    def forward(self,x,targets=None):
         device = x.device
         b,t = x.shape
         pos = torch.arange(0, t, dtype=torch.long, device=device) 
@@ -194,8 +195,13 @@ class ShotNet_Chained(nn.Module):
         images = self.image_mapping3(x)
         for i in range(1,t):
             images[:,i,:,:]+=images[:,i-1,:,:]
-        x = self.resnet3(images.reshape(b*t,self.n_pictures,self.pic_width,self.pic_width)).reshape(b,t,self.vocab_size)
-        return x
+        logits = self.resnet3(images.reshape(b*t,self.n_pictures,self.pic_width,self.pic_width)).reshape(b,t,self.vocab_size)
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            loss = None
+        return logits,loss
     
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
@@ -225,6 +231,8 @@ class ShotNet_Chained(nn.Module):
 if __name__=="__main__":
     model = ShotNet_Chained()
     words = torch.randint(0,900,(10,100))
+    targets = torch.randint(0,900,(10,100))
+    imag = model(words,targets)
+    logits,loss = imag
+    print(logits.shape,loss.item())
     
-    imag = model(words)
-    print(imag.shape)

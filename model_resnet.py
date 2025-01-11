@@ -13,9 +13,9 @@ class ResidualBlock(nn.Module):
             stride = 2
         self.inchan = inchan
         self.outchan = outchan
-        self.conv1 = nn.Conv2d(inchan,outchan,3,padding=1,stride = stride)
+        self.conv1 = nn.Conv2d(inchan,outchan,3,padding=1,stride = stride,bias=False)
         self.bn1 = nn.BatchNorm2d(outchan)
-        self.conv2 = nn.Conv2d(outchan,outchan,3,padding=1,stride = 1)
+        self.conv2 = nn.Conv2d(outchan,outchan,3,padding=1,stride = 1,bias=False)
         self.bn2 = nn.BatchNorm2d(outchan)
         self.skip = nn.Sequential()
         if augment:
@@ -61,7 +61,7 @@ class Resnetmini(nn.Module):
     def __init__(self,inchan,vec_len):
         super().__init__()
         self.conv1 = nn.Sequential(
-            nn.Conv2d(inchan,64,3),
+            nn.Conv2d(inchan,64,3,bias=False),
             nn.BatchNorm2d(64)
 
         )
@@ -92,15 +92,15 @@ class Resnetmini(nn.Module):
 
 
 if __name__=="__main__":
-    from torchvision import transforms
-    from PIL import Image
-    transform = transforms.Compose( [transforms.PILToTensor(),transforms.ConvertImageDtype(torch.float)] )
-
-    i = Image.open("image.png")
-    width, height = i.size
-    i=i.crop((0,0,min(width,height),min(width,height)))
-    data = transform(i.convert("RGB"))
-    train_set = torch.stack([data,data])
-
+    train_set = torch.randn((100,3,64,64))
+    labels = torch.randint(0,599,(100,))
     model = Resnetmini(3,600)
-    print(model(train_set))
+    out = model(train_set)
+    
+    optimizer = torch.optim.AdamW(model.parameters())
+    from torch.nn.functional import cross_entropy
+    
+    loss = cross_entropy(out,labels)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
